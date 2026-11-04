@@ -10,6 +10,8 @@ import logging
 from contextlib import suppress
 from datetime import UTC, datetime
 
+from fastapi import Request  # noqa: TC002 - FastAPI resolves route annotations at runtime
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 
 from core.database import (
@@ -23,12 +25,79 @@ from core.database import (
 
 logger = logging.getLogger(__name__)
 
-# Auto-switch thresholds
+# Columns the database fills itself; an import never sets them.
+_SERVER_COLUMNS = frozenset({"id", "created_at", "updated_at"})
+
+
+def _import_rows(model: type, rows: object) -> list[dict]:
+    """The importable rows of an uploaded list: objects only, known columns only.
+
+    Rows used to go straight into ``Model(**row)``, so one unknown key (or a
+    timestamp string) turned the whole import into a 500.
+    """
+    if not isinstance(rows, list):
+        return []
+    columns = set(model.__table__.columns.keys()) - _SERVER_COLUMNS
+    return [
+        {key: value for key, value in row.items() if key in columns}
+        for row in rows
+        if isinstance(row, dict)
+    ]
+
+
+# Auto-switch thresholds (defaults; operators tune these in config.learning).
 AUTO_SWITCH_MATCH_RATE = 99.0  # Switch to production at 99% match rate
 ROLLBACK_MATCH_RATE = 90.0  # Roll back to learning below 90% match rate
 MIN_PATTERNS_FOR_SWITCH = 10  # Minimum patterns before considering switch
-MIN_TOTAL_REQUESTS = 50  # Minimum total requests for reliable stats
+MIN_TOTAL_REQUESTS = 50  # Minimum recent requests for reliable stats
 CHECK_INTERVAL_SECONDS = 60  # How often to check auto-switch conditions
+
+# Results that count toward the match rate (an error is neither a hit nor a miss).
+_RATE_RESULTS = frozenset({"local_hit", "cloud_miss"})
+
+
+def _recent_match_rate(recent_results: list | None) -> tuple[float | None, int]:
+    """Match rate over the rolling window, as ``(rate_pct, sample_count)``.
+
+    The window is the per-device ``recent_results`` list. Decisions use this
+    rather than the lifetime rate so a device is judged on its *current*
+    behaviour: a device that has finished learning climbs to ~100% as its
+    recent requests become hits, instead of staying pinned by early misses,
+    and a freshly promoted device is measured on production traffic. Returns
+    ``(None, 0)`` when the window holds no hit/miss samples.
+    """
+    if not recent_results:
+        return None, 0
+    hits = 0
+    total = 0
+    for entry in recent_results:
+        result = entry.get("result") if isinstance(entry, dict) else None
+        if result in _RATE_RESULTS:
+            total += 1
+            if result == "local_hit":
+                hits += 1
+    if total == 0:
+        return None, 0
+    return round(hits / total * 100, 2), total
+
+
+def _auto_switch_settings() -> tuple[bool, float, int]:
+    """Read ``(enabled, min_match_rate, min_patterns)`` from config.learning.
+
+    Lazy import so the resilience module keeps no import-time dependency on the
+    config layer. Falls back to the module defaults if config is unavailable.
+    """
+    try:
+        from core.config import get_config_manager  # noqa: PLC0415
+
+        learning = get_config_manager().config.learning
+        return (
+            bool(getattr(learning, "auto_switch_to_production", False)),
+            float(getattr(learning, "min_match_rate_for_production", AUTO_SWITCH_MATCH_RATE)),
+            int(getattr(learning, "min_patterns_for_production", MIN_PATTERNS_FOR_SWITCH)),
+        )
+    except Exception:  # noqa: BLE001 - config optional; never break the scheduler
+        return False, AUTO_SWITCH_MATCH_RATE, MIN_PATTERNS_FOR_SWITCH
 
 
 class CloudIndependenceVerifier:
@@ -77,12 +146,20 @@ class CloudIndependenceVerifier:
             if not device:
                 return {"independent": False, "reason": "device_not_found"}
 
-        match_rate = stats.match_rate_pct if stats else 0.0
-        total_requests = stats.total_requests if stats else 0
+        lifetime_rate = stats.match_rate_pct if stats else 0.0
+        # Decisions use the rolling-window rate (current behaviour), falling
+        # back to the lifetime rate only when the window holds no samples.
+        window_rate, window_samples = _recent_match_rate(stats.recent_results if stats else None)
+        match_rate = window_rate if window_rate is not None else lifetime_rate
+        # The sample count that gates a decision is the window size when we have
+        # one, else the lifetime total — so a device is never promoted or rolled
+        # back on too little evidence.
+        total_requests = window_samples or (stats.total_requests if stats else 0)
+        _, min_match_rate, _ = _auto_switch_settings()
         has_patterns = patterns_count > 0
         has_templates = templates_count > 0
         has_high_confidence = max_template_confidence >= 0.85  # noqa: PLR2004
-        has_excellent_match_rate = match_rate >= AUTO_SWITCH_MATCH_RATE
+        has_excellent_match_rate = match_rate >= min_match_rate
         is_learning = device.mode == "learning"  # noqa: F841
         is_production = device.mode == "production"
 
@@ -224,6 +301,11 @@ class CloudIndependenceVerifier:
         if status.get("mode") != "production":
             return False
 
+        # Respect manual control: a device whose auto-switch is turned off was
+        # promoted (or pinned) deliberately, so the scheduler must not revert it.
+        if not status.get("auto_switch_enabled", False):
+            return False
+
         if match_rate < rollback_threshold and total_reqs >= MIN_TOTAL_REQUESTS:
             logger.warning(
                 f"Rollback triggered for {device_id}: "
@@ -280,6 +362,10 @@ class CloudIndependenceVerifier:
                     "response_field": m.response_field,
                     "response_type": m.response_type,
                     "transform": m.transform,
+                    # Without these a re-import lost enum mappings and served 0
+                    # for every formula mapping.
+                    "formula": m.formula,
+                    "enum_values": m.enum_values,
                     "intent": m.intent,
                     "confidence": m.confidence,
                 }
@@ -291,7 +377,7 @@ class CloudIndependenceVerifier:
         """Import previously exported patterns (for sharing between devices)."""
         count = 0
         async with self.db_manager.device_session(device_id) as session:
-            patterns = data.get("patterns", [])
+            patterns = _import_rows(RequestPattern, data.get("patterns"))
             if patterns:
                 p_ids = [p["pattern_id"] for p in patterns if "pattern_id" in p]
                 existing_p = set()
@@ -311,7 +397,7 @@ class CloudIndependenceVerifier:
                         if "pattern_id" in p_data:
                             existing_p.add(p_data["pattern_id"])
 
-            templates = data.get("templates", [])
+            templates = _import_rows(ResponseTemplate, data.get("templates"))
             if templates:
                 t_ids = [t["template_id"] for t in templates if "template_id" in t]
                 existing_t = set()
@@ -330,7 +416,7 @@ class CloudIndependenceVerifier:
                         if "template_id" in t_data:
                             existing_t.add(t_data["template_id"])
 
-            mappings = data.get("field_mappings", [])
+            mappings = _import_rows(FieldMapping, data.get("field_mappings"))
             if mappings:
                 m_ids = [m["mapping_id"] for m in mappings if "mapping_id" in m]
                 existing_m = set()
@@ -354,7 +440,12 @@ class CloudIndependenceVerifier:
 # API endpoint handlers for resilience endpoints
 
 
-def register_resilience_routes(app, get_db, _get_orch):  # noqa: C901
+def _service_not_ready() -> JSONResponse:
+    # A bare ``return {...}, 503`` is serialised by FastAPI as a 200 JSON array.
+    return JSONResponse(status_code=503, content={"error": "Service not ready"})
+
+
+def register_resilience_routes(app, get_db, get_orch):  # noqa: C901
     """Register resilience-related API routes."""
 
     @app.get("/api/independence/{device_id}")
@@ -362,17 +453,19 @@ def register_resilience_routes(app, get_db, _get_orch):  # noqa: C901
         """Check if a device can operate without vendor cloud."""
         db = get_db()
         if not db:
-            return {"error": "Service not ready"}, 503
+            return _service_not_ready()
         verifier = CloudIndependenceVerifier(db)
         status = await verifier.check_cloud_independence(device_id)
         return {"device_id": device_id, "independence": status}
 
+    # The trailing-slash form used to fall through to the vendor proxy route.
+    @app.get("/api/independence/", include_in_schema=False)
     @app.get("/api/independence")
     async def check_all_independence():
         """Check independence for all devices."""
         db = get_db()
         if not db:
-            return {"error": "Service not ready"}, 503
+            return _service_not_ready()
         verifier = CloudIndependenceVerifier(db)
         results = await verifier.verify_all_devices()
         return {"devices": results}
@@ -382,7 +475,7 @@ def register_resilience_routes(app, get_db, _get_orch):  # noqa: C901
         """Auto-switch device to production if conditions are met."""
         db = get_db()
         if not db:
-            return {"error": "Service not ready"}, 503
+            return _service_not_ready()
         verifier = CloudIndependenceVerifier(db)
         switched = await verifier.auto_switch_to_production(device_id)
         return {"device_id": device_id, "switched": switched}
@@ -392,19 +485,39 @@ def register_resilience_routes(app, get_db, _get_orch):  # noqa: C901
         """Export learned patterns for backup/sharing."""
         db = get_db()
         if not db:
-            return {"error": "Service not ready"}, 503
+            return _service_not_ready()
         verifier = CloudIndependenceVerifier(db)
         return await verifier.export_device_patterns(device_id)
 
     @app.post("/api/independence/{device_id}/import")
-    async def import_device_patterns(device_id: str, request):
-        """Import previously exported patterns."""
+    async def import_device_patterns(device_id: str, request: Request):
+        """Import previously exported patterns.
+
+        ``request`` used to be un-annotated, so FastAPI read it as a required
+        query parameter and every import was rejected with a 422.
+        """
         db = get_db()
         if not db:
-            return {"error": "Service not ready"}, 503
-        body = await request.json()
+            return _service_not_ready()
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": "Body is not JSON"})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"error": "Expected a JSON object"})
         verifier = CloudIndependenceVerifier(db)
-        count = await verifier.import_device_patterns(device_id, body)
+        try:
+            count = await verifier.import_device_patterns(device_id, body)
+        except Exception:
+            logger.exception("Pattern import for %s failed", device_id)
+            return JSONResponse(status_code=400, content={"error": "Invalid pattern import"})
+        # The engine serves its in-memory set when it has one: refresh it.
+        orchestrator = get_orch()
+        if orchestrator is not None:
+            try:
+                await orchestrator.sync_engine(device_id)
+            except Exception:
+                logger.exception("Could not refresh the served patterns for %s", device_id)
         return {"device_id": device_id, "patterns_imported": count}
 
 
@@ -454,11 +567,20 @@ class AutoSwitchScheduler:
 
     async def _check_all_devices(self):
         """Check all registered devices for auto-switch conditions."""
+        auto_promote, min_match_rate, min_patterns = _auto_switch_settings()
         devices = await self.db_manager.list_devices()
         for device in devices:
             device_id = device["device_id"]
             if device.get("mode") == "learning" and device.get("auto_switch_enabled", False):
-                switched = await self.verifier.auto_switch_to_production(device_id)
+                # Auto-promotion is opt-in at the deployment level: a device
+                # changing how it serves traffic on its own is a deliberate
+                # choice, enabled by the learning auto-switch setting. Rollback
+                # below is a safety net and is never gated this way.
+                if not auto_promote:
+                    continue
+                switched = await self.verifier.auto_switch_to_production(
+                    device_id, min_patterns=min_patterns, min_match_rate=min_match_rate
+                )
                 if switched:
                     logger.info(f"AutoSwitchScheduler: {device_id} switched to production")
             elif device.get("mode") == "production":

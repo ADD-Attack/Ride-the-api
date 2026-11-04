@@ -25,6 +25,7 @@ from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import delete, func, select
 
 from adapters import get_registered_registry
@@ -45,7 +46,14 @@ from core.buffer import (
     switch_backend,
 )
 from core.cert_manager import CertManager, get_cert_manager
-from core.config import Config, ConnectionType, get_config_manager
+from core.config import (
+    SECRET_MASK,
+    Config,
+    ConnectionType,
+    get_config_manager,
+    mask_secrets,
+    restore_masked_secrets,
+)
 from core.connection_watchdog import ConnectionWatchdog
 from core.database import (
     DatabaseManager,
@@ -58,9 +66,10 @@ from core.database import (
 )
 from core.dns_discovery import DNSDiscoveryRecorder, get_dns_recorder, set_dns_recorder
 from core.dns_server import get_dns_interceptor
+from core.http_framing import servable_status, without_framing_headers
 from core.llm_decipher import LLMDecipherService, get_llm_decipher
-from core.logging_config import setup_logging
-from core.modification import get_modification_engine
+from core.logging_config import get_log_level, setup_logging
+from core.modification import BLOCKED_STATUS, get_modification_engine
 from core.observability import (
     MetricsServer,
     build_tracer,
@@ -97,8 +106,10 @@ from core.resilience import (
 )
 from core.security import (
     ControlPlaneAuthMiddleware,
+    CrossSiteRequestGuard,
     MaxBodySizeMiddleware,
     SecurityHeadersMiddleware,
+    password_problem,
     setup_token,
 )
 from core.tls_mitm import (
@@ -622,6 +633,7 @@ async def handle_tls_upstream_response(handler_result: dict, response: dict) -> 
         status_code=response.get("status_code", 200),
         headers=response.get("headers") or {},
         body=normalize_request_body(response.get("body")),
+        correlation_key=handler_result.get("correlation_key"),
     )
 
 
@@ -957,7 +969,11 @@ async def lifespan(_app: FastAPI):  # noqa: C901, PLR0912, PLR0915
     watchdog_cfg = config.connection_watchdog
     if watchdog_cfg.enabled:
         try:
-            connection_watchdog = ConnectionWatchdog(watchdog_cfg)
+            # The cooldown must outlive the restart it triggers.
+            connection_watchdog = ConnectionWatchdog(
+                watchdog_cfg,
+                state_path=Path(config.core.device_db_dir).parent / "watchdog-state.json",
+            )
             await connection_watchdog.start()
             logger.info(
                 "Connection watchdog enabled: probe %s every %ds, restart after %d failures",
@@ -1102,6 +1118,12 @@ async def lifespan(_app: FastAPI):  # noqa: C901, PLR0912, PLR0915
     # Prune stale correlation rows so the training store never grows unbounded.
     # Runs regardless of TLS interception so pruning cannot be skipped.
     if orchestrator:
+        # A background flush can sit in an LLM call for minutes: stop it before
+        # the LLM client and the database it writes to are closed below.
+        try:
+            await orchestrator.cancel_background_flushes()
+        except Exception as e:
+            logger.error("Error cancelling background flushes: %s", e)  # noqa: TRY400
         try:
             await orchestrator.prune_stores()
         except Exception as e:
@@ -1122,25 +1144,31 @@ app = FastAPI(
     lifespan=lifespan,
 )
 # Restrict CORS to trusted local web UI origins to prevent cross-site request attacks.
+_TRUSTED_ORIGINS = ["http://localhost:8911", "http://127.0.0.1:8911"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8911", "http://127.0.0.1:8911"],
+    allow_origins=_TRUSTED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# CORS only governs what a page may read back; a cross-site "simple" POST is
+# still delivered. Refuse state-changing API calls a browser makes for another
+# site (S-17) -- with auth disabled they were the only barrier.
+app.add_middleware(CrossSiteRequestGuard, allowed_origins=_TRUSTED_ORIGINS)
 # Control-plane authentication: every /api/* route requires the single
 # control-plane password (full access, no read-only distinction). See core/security.py.
 app.add_middleware(
     ControlPlaneAuthMiddleware,
     get_security_config=lambda: config_manager.config.security,
 )
-# Control-plane body limits (F-09): reject /api/* request bodies larger than
-# proxy.max_request_size. The catch-all data-plane route stays exempt because
-# it legitimately proxies oversized device payloads to the cloud.
+# Body limits (F-09): /api/* bodies are held to proxy.max_request_size, device
+# (data-plane) bodies to the larger proxy.max_device_request_size -- the proxy
+# route reads them whole into memory, so they cannot be unbounded either.
 app.add_middleware(
     MaxBodySizeMiddleware,
     max_size=config_manager.config.proxy.max_request_size,
+    data_plane_max_size=config_manager.config.proxy.max_device_request_size,
 )
 # Security response headers (defense-in-depth against clickjacking, MIME sniffing, XSS)
 app.add_middleware(SecurityHeadersMiddleware)
@@ -2152,6 +2180,25 @@ async def configure_device_llm(device_id: str, request: Request):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _requested_database_url(body: dict) -> tuple[str | None, str | None]:
+    """The device database URL a request asks for, or why it cannot have it."""
+    database_url = body.get("database_url")
+    database_name = body.get("database_name")
+    if database_url:
+        try:
+            return db_manager.checked_device_db_url(str(database_url)), None
+        except ValueError as e:
+            return None, str(e)
+    if database_name:
+        # Only a name: create a new SQLite database for it.
+        try:
+            safe_name = sanitize_filename_component(str(database_name))
+        except ValueError as e:
+            return None, f"Invalid database_name: {e}"
+        return f"sqlite+aiosqlite:///{db_manager.device_db_dir / f'{safe_name}.db'}", None
+    return None, "Provide 'database_url' or 'database_name'"
+
+
 @app.post("/api/devices/{device_id}/database")
 async def assign_device_database(device_id: str, request: Request):
     """Assign a database (URL or name) to a device. Creates a new DB if only name given."""
@@ -2162,26 +2209,10 @@ async def assign_device_database(device_id: str, request: Request):
         return JSONResponse(
             status_code=400, content={"error": "Invalid JSON body: expected an object"}
         )
-    database_url = body.get("database_url")
+    database_url, error = _requested_database_url(body)
+    if error:
+        return JSONResponse(status_code=400, content={"error": error})
     database_name = body.get("database_name")
-
-    # If only a name is given, create a new SQLite database for it
-    if not database_url and database_name:
-        try:
-            safe_name = sanitize_filename_component(database_name)
-        except ValueError as e:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Invalid database_name: {e}"},
-            )
-        db_path = db_manager.device_db_dir / f"{safe_name}.db"
-        database_url = f"sqlite+aiosqlite:///{db_path}"
-    elif not database_url and not database_name:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Provide 'database_url' or 'database_name'"},
-        )
-
     success = await db_manager.assign_device_database(
         device_id,
         database_url=database_url,
@@ -2366,21 +2397,11 @@ async def register_device_ip(device_id: str, request: Request):  # noqa: PLR0911
                 "the proxy never intercepts its own traffic"
             },
         )
-    async with db_manager.core_session() as session:
-        result = await session.execute(
-            select(DeviceRegistry).where(DeviceRegistry.device_id == device_id)
-        )
-        device = result.scalar_one_or_none()
-        if not device:
-            return JSONResponse(status_code=404, content={"error": "Device not found"})
-        current_ips = list(device.ip_addresses or [])
-        if ip_address not in current_ips:
-            current_ips.append(ip_address)
-            device.ip_addresses = current_ips
-            await session.commit()
-            # Reflect the new IP in the reverse lookup immediately.
-            db_manager.invalidate_ip_lookup_cache()
-        return {"device_id": device_id, "ip_addresses": current_ips}
+    # The address moves to this device (it is taken from any previous holder).
+    current_ips = await db_manager.bind_ip(device_id, ip_address)
+    if current_ips is None:
+        return JSONResponse(status_code=404, content={"error": "Device not found"})
+    return {"device_id": device_id, "ip_addresses": current_ips}
 
 
 @app.get("/api/devices/{device_id}/patterns")
@@ -2519,6 +2540,21 @@ async def get_pattern_detail(device_id: str, pattern_id: str):
 # ── Pattern CRUD: Update, Patch, Delete ───────────────────────────────────────
 
 
+async def _resync_device_patterns(device_id: str) -> None:
+    """Make the engine serve the device's patterns as now stored.
+
+    The engine serves its in-memory set exclusively when it has one, so an
+    API change to the device DB alone left deleted or edited patterns being
+    served as before. Best-effort: the DB change already succeeded.
+    """
+    if orchestrator is None:
+        return
+    try:
+        await orchestrator.sync_engine(device_id)
+    except Exception:
+        logger.exception("Could not refresh the served patterns for %s", device_id)
+
+
 @app.put("/api/devices/{device_id}/patterns/{pattern_id}")
 async def put_pattern(device_id: str, pattern_id: str, request: Request):
     """Full update of a request pattern, its response template, and field mappings."""
@@ -2603,6 +2639,7 @@ async def put_pattern(device_id: str, pattern_id: str, request: Request):
                         response_field=m.get("response_field", ""),
                         response_type=m.get("response_type", ""),
                         transform=m.get("transform"),
+                        formula=decipher_ingest.stored_formula(m.get("formula")),
                         enum_values=m.get("enum_values"),
                         intent=pattern.intent,
                         confidence=m.get("confidence", 0.5),
@@ -2610,7 +2647,8 @@ async def put_pattern(device_id: str, pattern_id: str, request: Request):
                     session.add(fm)
 
             await session.commit()
-            return {"status": "ok", "pattern_id": pattern_id}
+        await _resync_device_patterns(device_id)
+        return {"status": "ok", "pattern_id": pattern_id}  # noqa: TRY300
     except Exception as e:
         return _client_error(e, "Invalid pattern update payload")
 
@@ -2690,6 +2728,7 @@ async def patch_pattern(device_id: str, pattern_id: str, request: Request):  # n
                         response_field=m.get("response_field", ""),
                         response_type=m.get("response_type", ""),
                         transform=m.get("transform"),
+                        formula=decipher_ingest.stored_formula(m.get("formula")),
                         enum_values=m.get("enum_values"),
                         intent=pattern.intent,
                         confidence=m.get("confidence", 0.5),
@@ -2697,7 +2736,8 @@ async def patch_pattern(device_id: str, pattern_id: str, request: Request):  # n
                     session.add(fm)
 
             await session.commit()
-            return {"status": "ok", "pattern_id": pattern_id}
+        await _resync_device_patterns(device_id)
+        return {"status": "ok", "pattern_id": pattern_id}  # noqa: TRY300
     except Exception as e:
         return _client_error(e, "Invalid pattern update payload")
 
@@ -2725,10 +2765,22 @@ async def delete_pattern(device_id: str, pattern_id: str):
             await session.execute(
                 delete(RequestPattern).where(RequestPattern.pattern_id == pattern_id)
             )
-            # Delete field mappings for this intent
-            await session.execute(delete(FieldMapping).where(FieldMapping.intent == pattern.intent))
+            # Field mappings are stored per intent: drop them only when no other
+            # pattern still uses that intent (they used to go for all of them).
+            intent_still_used = (
+                await session.execute(
+                    select(RequestPattern.id)
+                    .where(RequestPattern.intent == pattern.intent)
+                    .limit(1)
+                )
+            ).first()
+            if intent_still_used is None:
+                await session.execute(
+                    delete(FieldMapping).where(FieldMapping.intent == pattern.intent)
+                )
             await session.commit()
-            return {"status": "deleted", "pattern_id": pattern_id}
+        await _resync_device_patterns(device_id)
+        return {"status": "deleted", "pattern_id": pattern_id}  # noqa: TRY300
     except Exception as e:
         return _client_error(e, "Could not delete the pattern")
 
@@ -2805,6 +2857,10 @@ async def test_llm_profile(request: Request):
             content={"error": "Both 'base_url' and 'model_id' are required for the test"},
         )
     api_key = str(body.get("api_key", ""))
+    if api_key == SECRET_MASK:
+        # The form shows stored keys masked; testing an unchanged field means
+        # "use the key this profile already has".
+        api_key = llm_decipher_service.stored_api_key(str(body.get("name") or ""))
     timeout = int(body.get("timeout", 30) or 30)
     max_retries = int(body.get("max_retries", 2) or 2)
     result = await llm_decipher_service.test_connection(
@@ -3037,8 +3093,12 @@ async def set_buffer_backend_setting(request: Request):
 
 @app.get("/api/config")
 async def get_config():
-    """Return the full current configuration (validated YAML model_dump)."""
-    return {"config": config_manager.config.model_dump(mode="json")}
+    """Return the full current configuration (validated YAML model_dump).
+
+    Secrets (control-plane password, API keys, bridge passwords) are masked;
+    sending the mask back unchanged on PUT keeps the stored value.
+    """
+    return {"config": mask_secrets(config_manager.config.model_dump(mode="json"))}
 
 
 @app.put("/api/config")
@@ -3053,29 +3113,62 @@ async def put_config(request: Request):
             status_code=400,
             content={"error": "Invalid JSON body: expected an object with a 'config' key"},
         )
-    payload = body["config"]
+    # A dashboard save round-trips the masked GET payload: wherever a secret
+    # still reads as the mask, keep the stored value instead of writing the mask.
+    payload = restore_masked_secrets(body["config"], config_manager.config.model_dump(mode="json"))
     # LLM profiles are owned by the LLM settings API (``/api/llm/settings``),
     # which validates them and persists to the runtime override file. A config
     # save always sends the whole tree, so stamp the *effective* (runtime) LLM
     # section back in — present or not: a generic save can neither change nor
     # drop the profiles, and ``config.yaml`` stays aligned with the runtime.
-    # The Configuration page edits them through the LLM settings API instead.
+    # The keys are stamped in their configured form: a ${ENV} reference stays a
+    # reference instead of being replaced by the resolved secret on disk.
     if isinstance(payload, dict) and llm_decipher_service:
-        payload = {**payload, "llm_decipher": llm_decipher_service.get_settings()}
+        payload = {**payload, "llm_decipher": llm_decipher_service.get_settings_for_persistence()}
     try:
         ok = config_manager.update_config(payload)
-    except ValidationError as ve:
-        return JSONResponse(status_code=400, content={"error": f"Config validation failed: {ve}"})
+    except (ValidationError, PydanticValidationError) as ve:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Config validation failed", "details": _validation_details(ve)},
+        )
     except Exception:  # noqa: BLE001 - persist failure should not 500 silently
         logger.exception("Failed to update config")
         return JSONResponse(status_code=500, content={"error": "Failed to update config"})
     if not ok:
         return JSONResponse(status_code=500, content={"error": "Failed to persist config"})
     logger.info("Configuration updated via /api/config API")
-    return {"config": config_manager.config.model_dump(mode="json"), "status": "saved"}
+    return {
+        "config": mask_secrets(config_manager.config.model_dump(mode="json")),
+        "status": "saved",
+    }
+
+
+def _validation_details(error: Exception) -> list:
+    """Field locations and messages of a validation error, without input values.
+
+    Pydantic's string form echoes submitted values (which may be secrets), so
+    only ``loc``/``msg`` pairs are returned to the client.
+    """
+    if isinstance(error, PydanticValidationError):
+        return [
+            {"loc": [str(part) for part in err.get("loc", ())], "msg": err.get("msg", "")}
+            for err in error.errors()
+        ]
+    return [{"loc": [], "msg": str(error)}]
 
 
 _MIN_PASSWORD_LENGTH = 8
+
+
+def _new_password_problem(password: object) -> str | None:
+    """Why ``password`` cannot become the control-plane password, if it cannot."""
+    if not password or not isinstance(password, str):
+        return "password must be non-empty"
+    if len(password) < _MIN_PASSWORD_LENGTH:
+        return f"password must be at least {_MIN_PASSWORD_LENGTH} characters long"
+    # Header-safe: a password a browser cannot send locks the dashboard out.
+    return password_problem(password)
 
 
 @app.post("/api/auth/password")
@@ -3087,20 +3180,17 @@ async def set_control_plane_password(request: Request):
     password is configured, this endpoint is protected like any other
     ``/api/*`` route.
     """
-    if config_manager.config.security.auth_enabled and config_manager.config.security.password:
+    # First run only. With auth disabled the guard used to let anyone replace
+    # an existing password; change it through the authenticated config API.
+    if config_manager.config.security.password:
         return JSONResponse(status_code=403, content={"error": "A password is already set"})
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
     password = (body.get("password") or "") if isinstance(body, dict) else ""
-    if not password:
-        return JSONResponse(status_code=400, content={"error": "password must be non-empty"})
-    if len(password) < _MIN_PASSWORD_LENGTH:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"password must be at least {_MIN_PASSWORD_LENGTH} characters long"},
-        )
+    if problem := _new_password_problem(password):
+        return JSONResponse(status_code=400, content={"error": problem})
     ok = config_manager.set_security_password(password)
     if not ok:
         return JSONResponse(status_code=500, content={"error": "Failed to persist password"})
@@ -3287,6 +3377,7 @@ async def import_patterns(device_id: str, request: Request):
         else:
             pattern_db = PatternDB.model_validate(body)
             count = await ingester.import_patterns(device_id, pattern_db)
+        await _resync_device_patterns(device_id)
         return {"imported": count, "device_id": device_id, "warnings": result.warnings}  # noqa: TRY300
     except ValidationError as e:
         return JSONResponse(
@@ -3445,6 +3536,22 @@ except Exception as e:
 # upstream connection, not the message (the response object sets its own).
 _RESPONSE_HOP_BY_HOP = ("content-length", "transfer-encoding", "connection")
 
+# Statuses that must not carry a body.
+_BODYLESS_STATUSES = frozenset({204, 304})
+
+
+def _local_http_response(response: dict) -> Response:
+    """Serve a locally built ``{status_code, headers, body}`` response.
+
+    Learned template headers used to be passed through as-is: the vendor's
+    stale Content-Length won over the re-rendered body.
+    """
+    status = servable_status(response.get("status_code"))
+    headers = without_framing_headers(response.get("headers"))
+    if status in _BODYLESS_STATUSES:
+        return Response(status_code=status, headers=headers)
+    return JSONResponse(status_code=status, content=response.get("body", {}), headers=headers)
+
 
 def _client_error(exc: BaseException, message: str, status_code: int = 400) -> JSONResponse:
     """Return a control-plane error response that never leaks internals.
@@ -3483,6 +3590,22 @@ def _upstream_response(cloud_response, decoded: dict | None = None) -> Response:
     )
 
 
+def _raw_target(request: Request) -> str | None:
+    """``/{path}?{query}`` exactly as the client sent it, minus the vendor prefix.
+
+    The route's ``path`` is decoded ("%3F" becomes "?", "%20" a space) and
+    ``request.query_params`` folds repeated keys, so neither can rebuild what
+    the device asked for.
+    """
+    raw_path = request.scope.get("raw_path")
+    if not raw_path:
+        return None
+    parts = raw_path.decode("latin-1").split("/", 2)
+    target = "/" + (parts[2] if len(parts) > 2 else "")  # noqa: PLR2004 - "", vendor, rest
+    query = request.scope.get("query_string") or b""
+    return f"{target}?{query.decode('latin-1')}" if query else target
+
+
 async def _forward_bypassed_request(  # noqa: PLR0913
     adapter, request: Request, path: str, body, client_ip: str, *, raw_body: bytes | None = None
 ) -> Response:
@@ -3513,6 +3636,7 @@ async def _forward_bypassed_request(  # noqa: PLR0913
             body=body,
             body_bytes=raw_body,
             client_ip=client_ip,
+            raw_target=_raw_target(request),
         )
     )
     if cloud_response and cloud_response.success:
@@ -3535,7 +3659,7 @@ async def _forward_bypassed_request(  # noqa: PLR0913
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
     include_in_schema=False,
 )
-async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noqa: C901, PLR0911
+async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noqa: C901, PLR0911, PLR0912, PLR0915
     """Main proxy endpoint for device API requests.
 
     Routes:
@@ -3587,11 +3711,13 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
             path=f"/{path}",
         )
         decision = traffic_selector.evaluate(request_info)
-        if decision.value == "passthrough" and is_local:
-            # The device addressed *this* gateway, so a passthrough decision
+        if decision.value == "passthrough":
+            # The client addressed *this* gateway, so a passthrough decision
             # must actually forward the request upstream. Replying 200 with a
             # note instead fabricated a success the device never received.
-            logger.info(f"Passthrough for local traffic from {client_ip} to {vendor}: forwarding")
+            # (Honoured for every client: an intercepted request is forwarded
+            # the same way, only after the pipeline has seen it.)
+            logger.info(f"Passthrough for traffic from {client_ip} to {vendor}: forwarding")
             return await _forward_bypassed_request(
                 adapter, request, path, body, client_ip, raw_body=raw_body
             )
@@ -3617,16 +3743,25 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
         query_params=dict(request.query_params),
         body=body,
         body_bytes=raw_body,
+        raw_target=_raw_target(request),
     )
 
+    # Bound before the try so the error path can drop a capture registered by
+    # handle_request: an orphan would otherwise be paired with a later response.
+    device_id = ""
+    result: dict | None = None
     try:
         # Parse request to extract device info
         intercepted = await adapter.parse_request(intercepted)
-        device_id = intercepted.device_id or _extract_device_id(request.headers, path)
-
-        if not device_id:
-            logger.warning(f"Could not extract device ID from request to {vendor}")
-            device_id = f"unknown_{vendor}_{hash(str(request.url)) % 10000}"
+        # A source IP bound to a known device decides who is talking, as on the
+        # TLS and protocol paths: the claimed id (a header or a path segment)
+        # is the client's word, and any client could speak for any device.
+        device_id = (
+            await _resolve_device_for_ip(db_manager, client_ip)
+            or intercepted.device_id
+            or _extract_device_id(request.headers, path)
+        )
+        intercepted.device_id = device_id
 
         # Ensure device is registered
         await db_manager.get_or_create_device(device_id, vendor)
@@ -3635,6 +3770,20 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
         # mutating the intercepted request in place so the pipeline sees the
         # transformed request while the local-match is served.
         get_modification_engine().process_request(intercepted)
+        if intercepted.path != f"/{path}":
+            # The adapter or a REDIRECT rule chose another path: forward that.
+            intercepted.raw_target = None
+        if getattr(intercepted, "blocked", False):
+            # A block rule: the request goes neither upstream nor to the
+            # pipeline (BLOCK used to be recorded and then ignored).
+            logger.info("Request from %s blocked: %s", device_id, intercepted.block_reason)
+            return JSONResponse(
+                status_code=BLOCKED_STATUS,
+                content={"error": "blocked", "reason": intercepted.block_reason},
+            )
+        await _modification_delay(
+            (getattr(intercepted, "metadata", None) or {}).get("artificial_delay_ms")
+        )
 
         # Pass to pipeline for processing
         with get_tracer().start_as_current_span("proxy.handle_request") as span:
@@ -3663,11 +3812,8 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
             # response modification rules.
             metrics_registry.local_hits_total.inc()
             out_response = _apply_response_modifications(intercepted, result["response"])
-            return JSONResponse(
-                status_code=out_response.get("status_code", 200),
-                content=out_response.get("body", {}),
-                headers=out_response.get("headers", {}),
-            )
+            await _modification_delay(out_response.pop("delay_ms", None))
+            return _local_http_response(out_response)
         if result["action"] == "forward":
             # Prometheus: count cloud forwards (requests not served locally).
             metrics_registry.cloud_misses_total.inc()
@@ -3679,6 +3825,10 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
             # via 8.8.8.8 / 1.1.1.1, bypassing the local DNS.
             config = config_manager.config
             if config.learning.signal_forward_to_cloud:
+                # nginx performs this forward and the response never comes back
+                # here, so the captured request can never be paired: drop it now
+                # (not an error — the handoff itself succeeded).
+                await _discard_pending_capture(device_id, result, count_as_error=False)
                 # Signal nginx to forward the request to the real cloud upstream
                 return JSONResponse(
                     status_code=502,
@@ -3701,8 +3851,10 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
                     status_code=cloud_response.status_code or 200,
                     headers=cloud_response.response_headers or {"content-type": "application/json"},
                     body=resp_body,
+                    correlation_key=result.get("correlation_key"),
                 )
                 return _upstream_response(cloud_response, resp_body)
+            await _discard_pending_capture(device_id, result)
             return JSONResponse(
                 status_code=502,
                 content={
@@ -3730,6 +3882,7 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
 
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
+        await _discard_pending_capture(device_id, result)
         return JSONResponse(
             status_code=500,
             content={"error": "An internal error occurred"},
@@ -3739,6 +3892,36 @@ async def proxy_vendor_request(vendor: str, path: str, request: Request):  # noq
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _discard_pending_capture(
+    device_id: str, result: dict | None, *, count_as_error: bool = True
+) -> None:
+    """Drop the request captured for ``result`` if its response will never be paired.
+
+    Best effort: a cleanup failure is logged and never changes the reply.
+    """
+    key = (result or {}).get("correlation_key")
+    if not key or not device_id or not orchestrator:
+        return
+    try:
+        await orchestrator.discard_request(device_id, key, count_as_error=count_as_error)
+    except Exception:  # noqa: BLE001 - cleanup must not mask the real reply
+        logger.warning("Could not discard pending capture %s", key, exc_info=True)
+
+
+# A DELAY rule may not hold a device connection longer than this.
+_MAX_MODIFICATION_DELAY_S = 30.0
+
+
+async def _modification_delay(delay_ms: object) -> None:
+    """Honour a DELAY modification rule (it used to be recorded and ignored)."""
+    try:
+        seconds = float(delay_ms) / 1000
+    except (TypeError, ValueError):
+        return
+    if seconds > 0:
+        await asyncio.sleep(min(seconds, _MAX_MODIFICATION_DELAY_S))
 
 
 def _apply_response_modifications(intercepted: InterceptedRequest, response: dict) -> dict:
@@ -3792,12 +3975,18 @@ def _is_local_ip(ip: str) -> bool:
     return is_local_ip(ip)
 
 
+# Longest device id taken from a request: a claimed id becomes a registry row
+# and a database file name.
+_MAX_CLAIMED_DEVICE_ID = 128
+
+
 def _extract_device_id(headers: dict, path: str) -> str:
-    """Try to extract device ID from headers or path."""
+    """Try to extract device ID from headers or path (never empty)."""
     # Check common headers in priority order
     for header in _DEVICE_ID_HEADERS:
-        if header in headers:
-            return headers[header]
+        value = (headers.get(header) or "").strip()
+        if 0 < len(value) <= _MAX_CLAIMED_DEVICE_ID:
+            return value
     # Check path for common patterns
     parts = path.strip("/").split("/")
     for part in parts:
@@ -3815,11 +4004,19 @@ def _extract_device_id(headers: dict, path: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+_UVICORN_LOG_LEVELS = frozenset({"critical", "error", "warning", "info", "debug", "trace"})
+
+
 def main():
     """Run the server."""
     config = config_manager.config
     lg = config.observability.logging
     setup_logging(level=lg.level, fmt=lg.format, output=lg.output)
+    # uvicorn needs one of its own level names; use the level setup_logging
+    # actually applied (case-normalised, INFO for an unknown value).
+    uvicorn_level = get_log_level().lower()
+    if uvicorn_level not in _UVICORN_LOG_LEVELS:
+        uvicorn_level = "info"
     # Pass the app object (not the "core.server:app" string): the string
     # import path breaks in PyInstaller bundles where the module is packed and
     # no longer importable by name. Works in both venv and frozen builds.
@@ -3827,7 +4024,7 @@ def main():
         app,
         host=config.proxy.host,
         port=config.proxy.port,
-        log_level=lg.level.lower(),
+        log_level=uvicorn_level,
         reload=False,
     )
 
